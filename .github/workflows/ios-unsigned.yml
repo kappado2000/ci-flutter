@@ -1,0 +1,76 @@
+name: iOS unsigned build (reutilizabil)
+
+# IPA nesemnat pentru AltStore/Sideloadly, publicat ca release asset.
+# Apelat din repo-urile aplicațiilor cu `secrets: inherit` și
+# `permissions: contents: write`.
+on:
+  workflow_call:
+    inputs:
+      ipa_name:
+        description: Numele fișierului, fără „-unsigned.ipa” (ex. Notite)
+        type: string
+        required: true
+      draft:
+        description: Release draft (vizibil doar cu drept de scriere), pentru IPA-uri care conțin chei
+        type: boolean
+        default: false
+      flutter_version:
+        type: string
+        default: '3.47.0'
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          channel: 'stable'
+          cache: true
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: cocoapods-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'ios/Podfile') }}
+          restore-keys: cocoapods-${{ runner.os }}-
+
+      # Pași proprii aplicației (ex. MedRO recreează un fișier din .gitignore
+      # din secrete). Scriptul citește secretele din SECRETS_JSON.
+      - name: App-specific prebuild
+        if: hashFiles('ci/prebuild.sh') != ''
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: bash ci/prebuild.sh
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build unsigned iOS app
+        # Numărul de build se schimbă la fiecare rulare, altfel iOS consideră
+        # IPA-ul „deja instalat” și nu înlocuiește aplicația.
+        run: |
+          flutter build ios --release --no-codesign \
+            --build-number=${{ github.run_number }} \
+            --dart-define=BUILD_NUMBER=${{ github.run_number }}
+
+      - name: Package as unsigned IPA
+        run: |
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/Runner.app Payload/
+          zip -r "${{ inputs.ipa_name }}-unsigned.ipa" Payload
+
+      # Release asset, nu artefact Actions: spațiul pentru artefacte e mic și
+      # nu se eliberează imediat după ștergere.
+      - name: Publish the IPA as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ios-build-${{ github.run_number }}" \
+            "${{ inputs.ipa_name }}-unsigned.ipa" \
+            ${{ inputs.draft && '--draft' || '' }} \
+            --title "iOS unsigned build #${{ github.run_number }}" \
+            --notes "IPA nesemnat pentru AltStore/Sideloadly, din ${{ github.sha }}."

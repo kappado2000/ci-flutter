@@ -1,0 +1,351 @@
+name: iOS TestFlight build (reutilizabil)
+
+# Build semnat + upload în TestFlight. Apelat din repo-urile aplicațiilor cu
+# `secrets: inherit` și `permissions: {actions: write, contents: write}`.
+# Secrete necesare în repo-ul aplicației: IOS_DIST_CERTIFICATE_BASE64,
+# IOS_DIST_CERTIFICATE_PASSWORD, IOS_APP_PROVISION_PROFILE_BASE64,
+# IOS_ASC_KEY_ID, IOS_ASC_ISSUER_ID, IOS_ASC_API_KEY_BASE64
+# (+ IOS_WIDGET_PROVISION_PROFILE_BASE64 dacă există widget).
+on:
+  workflow_call:
+    inputs:
+      app_id:
+        description: ID-ul numeric din App Store Connect
+        type: string
+        required: true
+      bundle_id:
+        description: Bundle ID-ul cu care se semnează aplicația
+        type: string
+        required: true
+      profile_name:
+        description: Numele profilului App Store (ex. „Notite App Store”)
+        type: string
+        required: true
+      project_bundle_id:
+        description: >-
+          Bundle ID-ul din proiectul Xcode, dacă diferă de bundle_id (aplicații
+          instalate întâi prin AltStore, al căror ID are sufixul echipei)
+        type: string
+        default: ''
+      switch_to_manual_signing:
+        description: Proiectul e comis cu semnare automată; o trece pe manuală doar pentru acest build
+        type: boolean
+        default: false
+      widget_bundle_id:
+        type: string
+        default: ''
+      widget_profile_name:
+        type: string
+        default: ''
+      build_number_offset:
+        description: Adunat la run_number (MedRO 1000, ca să nu se suprapună cu build-urile nesemnate)
+        type: number
+        default: 0
+      closed_version:
+        description: >-
+          Ce faci când versiunea din pubspec e deja aprobată la Apple: „bump”
+          (build cu aprobată + 1 la patch) sau „fail” (oprește build-ul; pentru
+          aplicații care compară versiunea din pubspec, ca Calorii Fit)
+        type: string
+        default: bump
+      renew_below_days:
+        description: La rulările programate, build doar dacă ultimul build TestFlight expiră mai devreme
+        type: number
+        default: 21
+      publish_release:
+        description: Publică și IPA-ul semnat ca release asset (doar în repo-uri private!)
+        type: boolean
+        default: false
+      crashlytics_dsym:
+        description: Urcă dSYM-urile în Firebase Crashlytics
+        type: boolean
+        default: false
+      team_id:
+        type: string
+        default: FUR5C9CYR8
+      flutter_version:
+        type: string
+        default: '3.47.0'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      build: ${{ steps.expiry.outputs.build }}
+      name: ${{ steps.expiry.outputs.name }}
+    steps:
+      # GitHub oprește workflow-urile programate după 60 de zile fără
+      # activitate în repo; reactivarea le ține pornite.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          WF=$(basename "${WORKFLOW_REF%%@*}")
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$WF/enable"
+
+      - uses: actions/checkout@v4
+
+      - name: Expiry and App Store version check
+        id: expiry
+        env:
+          APP_ID: ${{ inputs.app_id }}
+          EVENT: ${{ github.event_name }}
+          CLOSED_VERSION: ${{ inputs.closed_version }}
+          RENEW_BELOW_DAYS: ${{ inputs.renew_below_days }}
+          ASC_KEY_ID: ${{ secrets.IOS_ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.IOS_ASC_ISSUER_ID }}
+          ASC_API_KEY_BASE64: ${{ secrets.IOS_ASC_API_KEY_BASE64 }}
+        run: |
+          pip install --quiet pyjwt cryptography
+          python3 - << 'PY'
+          import base64, json, os, re, sys, time, urllib.request
+          from datetime import datetime, timezone
+          import jwt
+
+          # Stări în care trenul versiunii e închis: Apple refuză upload-ul
+          # cu „Pre-Release Train closed” dacă versiunea nu e mai mare.
+          APPROVED = {
+              'ACCEPTED', 'PENDING_DEVELOPER_RELEASE', 'PROCESSING_FOR_DISTRIBUTION',
+              'READY_FOR_DISTRIBUTION', 'REPLACED_WITH_NEW_VERSION', 'READY_FOR_SALE',
+              'PROCESSING_FOR_APP_STORE', 'PENDING_APPLE_RELEASE', 'REMOVED_FROM_SALE',
+              'DEVELOPER_REMOVED_FROM_SALE',
+          }
+
+          def key(v):
+              parts = [int(x) for x in v.split('.')]
+              return tuple(parts + [0] * (3 - len(parts)))
+
+          now = int(time.time())
+          token = jwt.encode(
+              {'iss': os.environ['ASC_ISSUER_ID'], 'iat': now, 'exp': now + 600,
+               'aud': 'appstoreconnect-v1'},
+              base64.b64decode(os.environ['ASC_API_KEY_BASE64']),
+              algorithm='ES256', headers={'kid': os.environ['ASC_KEY_ID']})
+
+          def get(path):
+              req = urllib.request.Request('https://api.appstoreconnect.apple.com' + path,
+                                           headers={'Authorization': f'Bearer {token}'})
+              return json.load(urllib.request.urlopen(req))['data']
+
+          scheduled = os.environ['EVENT'] == 'schedule'
+          fail_mode = os.environ['CLOSED_VERSION'] == 'fail'
+          version = re.search(r'^version:\s*([0-9.]+)', open('pubspec.yaml').read(), re.M).group(1)
+          try:
+              builds = get(f"/v1/builds?filter[app]={os.environ['APP_ID']}&sort=-uploadedDate&limit=10"
+                           '&fields[builds]=version,processingState,expirationDate,expired')
+              valid = [b['attributes'] for b in builds
+                       if b['attributes']['processingState'] == 'VALID'
+                       and not b['attributes']['expired']]
+              if not valid:
+                  days = -1
+              else:
+                  exp = datetime.fromisoformat(valid[0]['expirationDate'])
+                  days = (exp - datetime.now(timezone.utc)).days
+              print(f'Ultimul build valid expiră în {days} zile.')
+
+              versions = [v['attributes'] for v in get(
+                  f"/v1/apps/{os.environ['APP_ID']}/appStoreVersions?filter[platform]=IOS&limit=200"
+                  '&fields[appStoreVersions]=versionString,appStoreState,appVersionState')]
+              approved = [v['versionString'] for v in versions
+                          if v.get('appVersionState') in APPROVED or v.get('appStoreState') in APPROVED]
+              latest = max(approved, key=key) if approved else None
+          except Exception as e:
+              # Pornit manual: o eroare trecătoare Apple nu blochează build-ul.
+              if scheduled or fail_mode:
+                  raise
+              print(f'::warning::App Store Connect indisponibil ({e}); build cu versiunea din pubspec.')
+              days, latest = -1, None
+
+          name = version
+          if latest and key(version) <= key(latest):
+              if fail_mode:
+                  print(f'::error::Versiunea {version} e închisă la Apple (ultima aprobată: {latest}). '
+                        'Crește versiunea în pubspec.yaml înainte de build.')
+                  sys.exit(1)
+              # Reînnoirile automate nu modifică pubspec-ul; build-ul primește
+              # aprobată + 1 la patch (doar în CI, fără commit).
+              major, minor, patch = key(latest)[:3]
+              name = f'{major}.{minor}.{patch + 1}'
+              print(f'::warning::Versiunea {version} din pubspec e închisă la Apple (ultima aprobată: '
+                    f'{latest}); build-ul folosește {name}. Crește versiunea în pubspec.yaml.')
+          print(f'pubspec: {version} | ultima aprobată: {latest} | build: {name}')
+
+          renew = days < int(os.environ['RENEW_BELOW_DAYS'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"build={'true' if not scheduled or renew else 'false'}\n")
+              f.write(f'name={name}\n')
+          PY
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+      PROJECT_BUNDLE_ID: ${{ inputs.project_bundle_id }}
+      PROFILE_NAME: ${{ inputs.profile_name }}
+      WIDGET_BUNDLE_ID: ${{ inputs.widget_bundle_id }}
+      WIDGET_PROFILE_NAME: ${{ inputs.widget_profile_name }}
+      TEAM_ID: ${{ inputs.team_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          channel: 'stable'
+          cache: true
+
+      # Doar descărcările de pod-uri, nu ios/Pods: `flutter build ipa` tot
+      # rulează un `pod install` curat, dar nu mai descarcă totul.
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: cocoapods-${{ runner.os }}-${{ hashFiles('pubspec.lock', 'ios/Podfile') }}
+          restore-keys: cocoapods-${{ runner.os }}-
+
+      - name: App-specific prebuild
+        if: hashFiles('ci/prebuild.sh') != ''
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: bash ci/prebuild.sh
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Aplicațiile instalate întâi prin AltStore au alt bundle ID decât cel
+      # din proiect; același ID face ca TestFlight s-o actualizeze pe loc,
+      # păstrând datele locale.
+      - name: Prepare the Xcode project
+        if: inputs.project_bundle_id != '' || inputs.switch_to_manual_signing
+        env:
+          SWITCH: ${{ inputs.switch_to_manual_signing }}
+        run: |
+          PBX=ios/Runner.xcodeproj/project.pbxproj
+          FROM="${PROJECT_BUNDLE_ID:-$BUNDLE_ID}"
+          if [ "$SWITCH" = "true" ]; then
+            FROM="$FROM" perl -0pi -e 's/PRODUCT_BUNDLE_IDENTIFIER = \Q$ENV{FROM}\E;/PRODUCT_BUNDLE_IDENTIFIER = $ENV{BUNDLE_ID};\n\t\t\t\tCODE_SIGN_STYLE = Manual;\n\t\t\t\tDEVELOPMENT_TEAM = $ENV{TEAM_ID};\n\t\t\t\t"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "Apple Distribution";\n\t\t\t\tPROVISIONING_PROFILE_SPECIFIER = "$ENV{PROFILE_NAME}";/g' "$PBX"
+            grep -c "PROVISIONING_PROFILE_SPECIFIER = \"$PROFILE_NAME\";" "$PBX"
+          else
+            sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = $FROM;/PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;/" "$PBX"
+            grep -c "PRODUCT_BUNDLE_IDENTIFIER = $BUNDLE_ID;" "$PBX"
+          fi
+
+      # Certificatul de distribuție intră într-un keychain temporar, care
+      # există doar cât rulează build-ul; profilurile merg unde le caută Xcode.
+      - name: Import signing certificate and provisioning profiles
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.IOS_DIST_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_DIST_CERTIFICATE_PASSWORD }}
+          APP_PROFILE_BASE64: ${{ secrets.IOS_APP_PROVISION_PROFILE_BASE64 }}
+          WIDGET_PROFILE_BASE64: ${{ secrets.IOS_WIDGET_PROVISION_PROFILE_BASE64 }}
+        run: |
+          if [ -z "$CERTIFICATE_BASE64" ] || [ -z "$APP_PROFILE_BASE64" ]; then
+            echo "::error::Lipsesc secretele de semnare din repo-ul aplicației"; exit 1
+          fi
+          CERT_PATH="$RUNNER_TEMP/distribution.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+
+          echo -n "$CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          mkdir -p "$PROFILE_DIR"
+          echo -n "$APP_PROFILE_BASE64" | base64 --decode -o "$PROFILE_DIR/app.mobileprovision"
+          if [ -n "$WIDGET_BUNDLE_ID" ]; then
+            test -n "$WIDGET_PROFILE_BASE64"
+            echo -n "$WIDGET_PROFILE_BASE64" | base64 --decode -o "$PROFILE_DIR/widget.mobileprovision"
+          fi
+
+      - name: Write export options plist
+        run: |
+          WIDGET_ENTRY=""
+          if [ -n "$WIDGET_BUNDLE_ID" ]; then
+            WIDGET_ENTRY="<key>$WIDGET_BUNDLE_ID</key><string>$WIDGET_PROFILE_NAME</string>"
+          fi
+          cat > "$RUNNER_TEMP/ExportOptions.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$BUNDLE_ID</key>
+              <string>$PROFILE_NAME</string>
+              $WIDGET_ENTRY
+            </dict>
+          </dict>
+          </plist>
+          PLIST
+
+      # Numărul de build crește la fiecare rulare (TestFlight refuză dubluri).
+      - name: Build signed IPA
+        run: |
+          N=$(( ${{ inputs.build_number_offset }} + ${{ github.run_number }} ))
+          flutter build ipa --release \
+            --build-name=${{ needs.check.outputs.name }} \
+            --build-number=$N \
+            --dart-define=BUILD_NUMBER=$N \
+            --export-options-plist="$RUNNER_TEMP/ExportOptions.plist"
+
+      # Fără dSYM-ul exact al binarului, Crashlytics arată adrese în loc de
+      # funcții. Nu blochează upload-ul dacă eșuează.
+      - name: Upload dSYMs to Crashlytics
+        if: inputs.crashlytics_dsym
+        continue-on-error: true
+        run: |
+          find build/ios/archive/Runner.xcarchive/dSYMs -name "*.dSYM" -print0 \
+            | xargs -0 -I{} ios/Pods/FirebaseCrashlytics/upload-symbols \
+                -gsp ios/Runner/GoogleService-Info.plist -p ios {}
+
+      - name: Publish the IPA as a release asset
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ios-appstore-build-${{ github.run_number }}" \
+            build/ios/ipa/*.ipa \
+            --title "iOS signed build #${{ github.run_number }}" \
+            --notes "Signed IPA (App Store Connect export) for build ${{ github.sha }}."
+
+      # Autentificare cu cheia API (fără 2FA), deci merge fără om. Upload-ul
+      # nu atașează build-ul la un grup TestFlight; asta se face manual.
+      - name: Upload to TestFlight
+        env:
+          ASC_KEY_ID: ${{ secrets.IOS_ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.IOS_ASC_ISSUER_ID }}
+          ASC_API_KEY_BASE64: ${{ secrets.IOS_ASC_API_KEY_BASE64 }}
+        run: |
+          KEY_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$KEY_DIR"
+          echo -n "$ASC_API_KEY_BASE64" | base64 --decode -o "$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+
+          IPA_PATH=$(ls build/ios/ipa/*.ipa | head -n1)
+          xcrun altool --upload-app -f "$IPA_PATH" -t ios \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Clean up keychain and key
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -rf "$HOME/.appstoreconnect" || true
