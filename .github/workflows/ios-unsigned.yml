@@ -72,5 +72,6 @@ jobs:
           gh release create "ios-build-${{ github.run_number }}" \
             "${{ inputs.ipa_name }}-unsigned.ipa" \
             ${{ inputs.draft && '--draft' || '' }} \
+            --target "${{ github.sha }}" \
             --title "iOS unsigned build #${{ github.run_number }}" \
             --notes "IPA nesemnat pentru AltStore/Sideloadly, din ${{ github.sha }}."

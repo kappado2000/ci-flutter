@@ -325,6 +325,7 @@ jobs:
         run: |
           gh release create "ios-appstore-build-${{ github.run_number }}" \
             build/ios/ipa/*.ipa \
+            --target "${{ github.sha }}" \
             --title "iOS signed build #${{ github.run_number }}" \
             --notes "Signed IPA (App Store Connect export) for build ${{ github.sha }}."
 
